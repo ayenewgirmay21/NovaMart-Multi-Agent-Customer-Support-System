@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# ─────────────────────────────────────────────
+# Environment & Secrets
+# ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─────────────────────────────────────────────
+# Claude Code session data
+# ─────────────────────────────────────────────
+.claude/
+
+# ─────────────────────────────────────────────
+# Test / runtime artifacts
+# ─────────────────────────────────────────────
+payload.json
+response.json
+
+# NovaMart deployment and test artifacts
+deployment-*.zip
+xray-payload.json
+xray-response.json
+NovaMartCloudFormationListExports.json
+NovaMartDynamoDBAccess.json
+delete-order-key.json
+.bedrock_agentcore/
+
+# Local backup files
+*.bak
+*.backup
+*.before_*
+
