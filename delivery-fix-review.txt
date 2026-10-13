@@ -1,0 +1,39 @@
+﻿git : warning: in the working copy of '.\src\agent_orchestrator.py.before-warning-propagation.bak', LF will be replaced by CRLF the next time Git touches it
+At line:1 char:1
++ git diff --no-index -- .\src\agent_orchestrator.py.before-warning-pro ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+diff --git "a/.\\src\\agent_orchestrator.py.before-warning-propagation.bak" "b/.\\src\\agent_orchestrator.py"
+index 4d28cc2..6492136 100644
+--- "a/.\\src\\agent_orchestrator.py.before-warning-propagation.bak"
++++ "b/.\\src\\agent_orchestrator.py"
+@@ -260,7 +260,26 @@ def route_to_inventory_agent(session_id: str, request: str) -> dict:
+               f"Current WorkflowState: {json.dumps(state, default=str)}\n"
+               f"Request: {request}\nGather facts.")
+     result = inventory(prompt)
+-    updated = _update_workflow_state(session_id, {"inventory_findings": str(result),
++    findings = str(result)
++
++    # Preserve deterministic delivery-date warnings in workflow state.
++    # This performs a read only; it does not modify the order.
++    import re
++    order_ids = re.findall(r"\bORD-[A-Za-z0-9-]+\b", request, flags=re.IGNORECASE)
++    delivery_warning = None
++    for order_id in dict.fromkeys(order_ids):
++        order = check_order_status(customer_id, order_id)
++        if order.get("delivery_date_warning"):
++            delivery_warning = order["delivery_date_warning"]
++            break
++        if order.get("delivery_date_check") == "DELIVERY_CONFIRMED":
++            delivery_warning = None
++            break
++
++    if delivery_warning and delivery_warning not in findings:
++        findings += "\n\nDeterministic delivery-date assessment: " + delivery_warning
++
++    updated = _update_workflow_state(session_id, {"inventory_findings": findings,
+                                                   "inventory_agent": str(result),
+                                                   "status": "INVENTORY_COMPLETE"},
+                                     expected_version=state["version"])

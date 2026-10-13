@@ -1,0 +1,88 @@
+﻿{
+    "Items": [
+        {
+            "quantity": {
+                "S": "1"
+            },
+            "order_date": {
+                "S": "2026-07-12"
+            },
+            "product_name": {
+                "S": "Desk Lamp LED"
+            },
+            "product_category": {
+                "S": "Home"
+            },
+            "return_eligible": {
+                "S": "false"
+            },
+            "status": {
+                "S": "cancelled"
+            },
+            "tracking_number": {
+                "S": "TRK344718217"
+            },
+            "customer_id": {
+                "S": "CUST-001"
+            },
+            "price": {
+                "S": "29.99"
+            },
+            "estimated_delivery": {
+                "S": "2026-07-17"
+            },
+            "order_id": {
+                "S": "ORD-15728"
+            }
+        },
+        {
+            "customer_id": {
+                "S": "CUST-001"
+            },
+            "status": {
+                "S": "REFUND_DENIED"
+            },
+            "order_id": {
+                "S": "ORD-27176"
+            }
+        },
+        {
+            "quantity": {
+                "S": "3"
+            },
+            "order_date": {
+                "S": "2026-06-23"
+            },
+            "product_name": {
+                "S": "Running Shoes X200"
+            },
+            "product_category": {
+                "S": "Footwear"
+            },
+            "return_eligible": {
+                "S": "false"
+            },
+            "status": {
+                "S": "delivered"
+            },
+            "tracking_number": {
+                "S": "TRK150779227"
+            },
+            "customer_id": {
+                "S": "CUST-001"
+            },
+            "price": {
+                "S": "89.99"
+            },
+            "estimated_delivery": {
+                "S": "2026-06-28"
+            },
+            "order_id": {
+                "S": "ORD-40256"
+            }
+        }
+    ],
+    "Count": 3,
+    "ScannedCount": 3,
+    "ConsumedCapacity": null
+}

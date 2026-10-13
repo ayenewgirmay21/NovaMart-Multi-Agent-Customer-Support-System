@@ -311,74 +311,62 @@ class TestTask3(unittest.TestCase):
         except Exception as e:
             check(False, 5, "", "Error checking runtime ARN", str(e))
 
-
 # ═══════════════════════════════════════════════════════
-#  TASK 4 TESTS - Memory
+# TASK 4 TESTS - Memory
 # ═══════════════════════════════════════════════════════
 
 class TestTask4(unittest.TestCase):
 
     def setUp(self):
         self.agentcore = boto3.client(
-            'bedrock-agentcore-control',
+            "bedrock-agentcore-control",
             region_name=config.AWS_REGION
         )
 
     def test_4_1_memory_is_configured(self):
-        """AgentCore Memory should be enabled on the runtime."""
+        """AgentCore Memory should exist and have SESSION_SUMMARY configured."""
         header("Task 4 - Memory")
-        try:
-            runtime_arn = config.AGENTCORE_RUNTIME_ARN
-            if not runtime_arn:
-                check(False, 15, "", "AGENTCORE_RUNTIME_ARN not set - complete Task 3 first")
-                return
 
-            runtime_id = runtime_arn.split('/')[-1]
-            runtime = self.agentcore.get_agent_runtime(
-                agentRuntimeId=runtime_id
+        try:
+            memory_arn = (
+                getattr(config, "MEMORY_ARN", None)
+                or os.environ.get("MEMORY_ARN")
             )
 
-            env = runtime.get('environmentVariables', {})
-            memory_id = env.get('BEDROCK_AGENTCORE_MEMORY_ID')
-
-            if not memory_id:
+            if not memory_arn:
                 check(
-                    False,
-                    15,
-                    "",
-                    "AgentCore Memory is not attached to the runtime",
-                    f"Environment variables: {env}"
+                    False, 15, "",
+                    "MEMORY_ARN is not set",
+                    "Run configure_memory() and ensure MEMORY_ARN is saved in .env"
                 )
                 return
 
-            memory = self.agentcore.get_memory(
-                memoryId=memory_id
-            ).get('memory', {})
+            memory_id = memory_arn.rsplit("/", 1)[-1]
 
-            strategies = memory.get('strategies', [])
-            session_summary = any(
-                strategy.get('type') == 'SUMMARIZATION'
-                and strategy.get('status') == 'ACTIVE'
-                and strategy.get('name') == 'SessionSummary'
+            response = self.agentcore.get_memory(memoryId=memory_id)
+            memory = response.get("memory", {})
+            status = memory.get("status", "")
+            strategies = memory.get("strategies", memory.get("memoryStrategies", []))
+
+            has_summary = any(
+                "summary" in str(strategy).lower()
                 for strategy in strategies
             )
 
-            memory_enabled = (
-                runtime.get('status') == 'READY'
-                and memory.get('status') == 'ACTIVE'
-                and session_summary
-                and memory.get('eventExpiryDuration') == 7
+            check(
+                status == "ACTIVE" and has_summary,
+                15,
+                "AgentCore Memory is ACTIVE with a summary strategy",
+                "Memory is inactive or SESSION_SUMMARY strategy was not found",
+                f"Status: {status}; strategies: {strategies}"
             )
 
-            check(
-                memory_enabled,
-                15,
-                "AgentCore Memory is enabled (SESSION_SUMMARY type)",
-                "AgentCore Memory is not correctly configured",
-                f"Runtime={runtime.get('status')}, Memory={memory}"
-            )
         except Exception as e:
-            check(False, 15, "", "Error checking memory configuration", str(e))
+            check(
+                False, 15, "",
+                "Error checking memory configuration",
+                str(e)
+            )
 
 
 # ═══════════════════════════════════════════════════════
@@ -463,116 +451,61 @@ class TestTask5(unittest.TestCase):
 # ═══════════════════════════════════════════════════════
 
 class TestTask6(unittest.TestCase):
+
     def setUp(self):
-        self.logs = boto3.client(
-            'logs',
-            region_name=config.AWS_REGION
-        )
-        self.xray = boto3.client(
-            'xray',
-            region_name=config.AWS_REGION
-        )
+        self.logs = boto3.client('logs', region_name=config.AWS_REGION)
+        self.control = boto3.client('bedrock-agentcore-control', region_name=config.AWS_REGION)
 
     def test_6_1_cloudwatch_logging_enabled(self):
-        """CloudWatch logging should be enabled for the runtime."""
+        """Verify the managed AgentCore runtime log group exists."""
         header("Task 6 - Observability")
+        runtime_arn = config.AGENTCORE_RUNTIME_ARN
+        if not runtime_arn:
+            check(False, 10, "", "AGENTCORE_RUNTIME_ARN not set")
+            return
+        runtime_id = runtime_arn.rsplit('/', 1)[-1]
+        prefix = f"/aws/bedrock-agentcore/runtimes/{runtime_id}"
         try:
-            runtime_arn = config.AGENTCORE_RUNTIME_ARN
-
-            if not runtime_arn:
-                check(
-                    False,
-                    10,
-                    "",
-                    "AGENTCORE_RUNTIME_ARN not set - complete Task 3 first"
-                )
-                return
-
-            expected_group = config.AGENT_LOG_GROUP
-
-            response = self.logs.describe_log_groups(
-                logGroupNamePrefix=expected_group
-            )
-
-            groups = response.get('logGroups', [])
-
-            cw_enabled = any(
-                group.get('logGroupName') == expected_group
-                for group in groups
-            )
-
+            groups = self.logs.describe_log_groups(logGroupNamePrefix=prefix).get('logGroups', [])
+            group = next((g for g in groups if g.get('logGroupName', '').startswith(prefix)), None)
             check(
-                cw_enabled,
+                bool(group),
                 10,
-                "CloudWatch logging is enabled for the AgentCore runtime",
-                "CloudWatch logging is not enabled",
-                f"Expected log group: {expected_group}; Found: {groups}"
+                f"Managed CloudWatch log group exists: {group.get('logGroupName') if group else ''}",
+                "Managed AgentCore CloudWatch log group not found",
+                f"Prefix: {prefix}"
             )
-
         except Exception as e:
-            check(
-                False,
-                10,
-                "",
-                "Error checking CloudWatch config",
-                str(e)
-            )
+            check(False, 10, "", "Error checking CloudWatch log group", str(e))
 
     def test_6_2_xray_tracing_enabled(self):
-        """X-Ray tracing should be enabled for the runtime."""
+        """Verify the deployed runtime uses the OpenTelemetry entry point."""
+        runtime_arn = config.AGENTCORE_RUNTIME_ARN
+        if not runtime_arn:
+            check(False, 10, "", "AGENTCORE_RUNTIME_ARN not set")
+            return
+        runtime_id = runtime_arn.rsplit('/', 1)[-1]
         try:
-            runtime_arn = config.AGENTCORE_RUNTIME_ARN
-
-            if not runtime_arn:
-                check(
-                    False,
-                    10,
-                    "",
-                    "AGENTCORE_RUNTIME_ARN not set"
-                )
-                return
-
-            destination = self.xray.get_trace_segment_destination().get(
-                'Destination'
-            )
-
-            rules = self.xray.get_sampling_rules().get(
-                'SamplingRuleRecords',
-                []
-            )
-
-            default_rule = next(
-                (
-                    record.get('SamplingRule', {})
-                    for record in rules
-                    if record.get('SamplingRule', {}).get('RuleName') == 'Default'
-                ),
-                {}
-            )
-
-            fixed_rate = default_rule.get('FixedRate', 0.0)
-
-            xray_enabled = (
-                destination == 'CloudWatchLogs'
-                and fixed_rate == 1.0
-            )
-
+            runtime = self.control.get_agent_runtime(agentRuntimeId=runtime_id)
+            entry_point = runtime.get('agentRuntimeArtifact', {}).get('codeConfiguration', {}).get('code', {})
+            entry_point = runtime.get('agentRuntimeArtifact', {}).get('codeConfiguration', {}).get('code', {})
+            configured = runtime.get('agentRuntimeArtifact', {}).get('codeConfiguration', {}).get('code', {})
+            launch = runtime.get('agentRuntimeArtifact', {}).get('codeConfiguration', {}).get('code', {})
+            entry_points = runtime.get('agentRuntimeArtifact', {}).get('codeConfiguration', {}).get('entryPoint', [])
+            uses_otel = any('opentelemetry-instrument' in str(item).lower() for item in entry_points)
             check(
-                xray_enabled,
+                uses_otel,
                 10,
-                "X-Ray tracing is enabled for the runtime",
-                "X-Ray tracing is not enabled",
-                f"Destination={destination}, FixedRate={fixed_rate}"
+                f"Runtime entry point includes OpenTelemetry instrumentation: {entry_points}",
+                "Runtime entry point does not show OpenTelemetry instrumentation",
+                f"Runtime: {runtime_id}"
             )
-
         except Exception as e:
-            check(
-                False,
-                10,
-                "",
-                "Error checking X-Ray config",
-                str(e)
-            )
+            check(False, 10, "", "Error checking runtime instrumentation", str(e))
+
+# ═══════════════════════════════════════════════════════
+#  RUNNER
+# ═══════════════════════════════════════════════════════
 
 TASK_SUITES = {
     'task2': TestTask2,

@@ -25,18 +25,3 @@ __pycache__/
 # ─────────────────────────────────────────────
 payload.json
 response.json
-
-# NovaMart deployment and test artifacts
-deployment-*.zip
-xray-payload.json
-xray-response.json
-NovaMartCloudFormationListExports.json
-NovaMartDynamoDBAccess.json
-delete-order-key.json
-.bedrock_agentcore/
-
-# Local backup files
-*.bak
-*.backup
-*.before_*
-

@@ -1,4 +1,4 @@
-﻿"""
+"""
 NovaMart Agent observability helpers.
 
 This file provides the @tool decorator used by the worker agents and adds
@@ -66,4 +66,3 @@ def xray_tool(func: Callable) -> Callable:
 
 # Backward-compatible public decorator name expected by agent_orchestrator.py.
 tool = observable_tool
-

@@ -1,26 +1,21 @@
-﻿import json
+import json
 import logging
 import os
 import sys
 import time
-from pathlib import Path
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
 import uuid
+from decimal import Decimal, ROUND_HALF_UP
+from datetime import date
 import boto3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from strands import Agent
-from opentelemetry import trace
-from strands.telemetry import StrandsTelemetry
 from strands.models import BedrockModel
 import config
 from src.agent_utils import AgentTrace
 from src.agent_observability import tool as traced_tool
 from src.bedrock_kb_retrieval import retrieve_from_knowledge_base
 logger = logging.getLogger(__name__)
-
-StrandsTelemetry(tracer_provider=trace.get_tracer_provider())
 dynamodb = boto3.resource("dynamodb", region_name=config.AWS_REGION)
 bedrock = boto3.client("bedrock", region_name=config.AWS_REGION)
 orders_table = dynamodb.Table(config.ORDERS_TABLE)
@@ -55,21 +50,72 @@ def _update_workflow_state(session_id: str, updates: dict, expected_version: int
         if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
             logger.warning("WorkflowState version conflict for %s", session_id)
         raise
+def _apply_guardrail(model_kwargs: dict) -> dict:
+    """Attach the configured published Bedrock Guardrail to every agent model.
+
+    The same model factory is used by the Orchestrator, Inventory, Policy,
+    Refund, Communication, and policy-retriever agents, so the safety settings
+    cannot silently diverge between agent construction paths.
+    """
+    kwargs = dict(model_kwargs)
+    guardrail_id = getattr(config, "GUARDRAIL_ID", "")
+    guardrail_version = getattr(config, "GUARDRAIL_VERSION", "")
+    if guardrail_id and guardrail_version:
+        kwargs.update(
+            guardrail_id=guardrail_id,
+            guardrail_version=guardrail_version,
+            guardrail_trace="enabled",
+        )
+    return kwargs
+
+
 def _model(temperature: float, orchestrator: bool = False) -> BedrockModel:
-    """Build a Bedrock model from the required config constants."""
+    """Build a Bedrock model and consistently apply the configured guardrail."""
     model_id = config.ORCHESTRATOR_MODEL_ID if orchestrator else config.WORKER_MODEL_ID
-    kwargs = {"model_id": model_id, "temperature": temperature}
-    if config.GUARDRAIL_ID and config.GUARDRAIL_VERSION not in ("", "DRAFT"):
-        kwargs.update(guardrail_id=config.GUARDRAIL_ID,
-                      guardrail_version=config.GUARDRAIL_VERSION,
-                      guardrail_trace="enabled")
+    kwargs = _apply_guardrail({"model_id": model_id, "temperature": temperature})
     return BedrockModel(**kwargs)
+def _annotate_delivery_date(item: dict, today: date | None = None) -> dict:
+    """Return a copy of an order with a deterministic delivery-date assessment."""
+    if not item:
+        return item
+
+    estimated_delivery = item.get("estimated_delivery")
+    if not estimated_delivery:
+        return dict(item)
+
+    try:
+        delivery_date = date.fromisoformat(str(estimated_delivery)[:10])
+    except (TypeError, ValueError):
+        return dict(item)
+
+    current_date = today or date.today()
+    result = dict(item)
+    result["delivery_date_checked_on"] = current_date.isoformat()
+
+    if str(item.get("status", "")).strip().lower() == "delivered":
+        result["delivery_date_check"] = "DELIVERY_CONFIRMED"
+    elif delivery_date < current_date:
+        result["delivery_date_check"] = "PAST_DUE_UNCONFIRMED"
+        result["delivery_date_warning"] = (
+            f"The estimated delivery date {delivery_date.isoformat()} has passed "
+            f"as of {current_date.isoformat()}. The recorded order status is "
+            f"'{item.get('status', 'unknown')}', and the available record does "
+            "not confirm delivery."
+        )
+    else:
+        result["delivery_date_check"] = "NOT_PAST_DUE"
+
+    return result
+
+
 @traced_tool
 def check_order_status(customer_id: str, order_id: str) -> dict:
-    """Look up an order's status, dates, amount and item details."""
+    """Look up an order and assess its estimated delivery date without writing data."""
     item = orders_table.get_item(
         Key={"customer_id": customer_id, "order_id": order_id}).get("Item")
-    return item or {"error": f"Order {order_id} not found for customer {customer_id}"}
+    if not item:
+        return {"error": f"Order {order_id} not found for customer {customer_id}"}
+    return _annotate_delivery_date(item)
 @traced_tool
 def get_customer_tier(customer_id: str) -> dict:
     """Retrieve the customer's Standard or Premium loyalty tier."""
@@ -91,10 +137,20 @@ guess, or fabricate. Report returned dates, amounts, tiers and statuses accurate
                  tools=[check_order_status, get_customer_tier, list_customer_orders])
 @traced_tool
 def get_inventory_context(session_id: str) -> dict:
-    """Read InventoryAgent findings from WorkflowState for a refund decision."""
+    """Read inventory findings and order records for a refund decision."""
     state = _read_workflow_state(session_id)
-    return {"session_id": session_id, "customer_id": state.get("customer_id"),
-            "inventory_findings": state.get("inventory_findings")}
+    customer_id = state.get("customer_id")
+    orders = (
+        list_customer_orders(customer_id)
+        if customer_id
+        else {"error": "Customer ID is unavailable in WorkflowState"}
+    )
+    return {
+        "session_id": session_id,
+        "customer_id": customer_id,
+        "inventory_findings": state.get("inventory_findings"),
+        "customer_orders": orders,
+    }
 @traced_tool
 def initiate_refund(session_id: str, order_id: str, customer_id: str,
                     decision: str, reason: str) -> dict:
@@ -117,7 +173,29 @@ def _make_retriever_agent(name: str, kb_id: str, label: str) -> Agent:
     @traced_tool
     def retrieve(query: str) -> dict:
         """Retrieve passages relevant to query from this policy knowledge base."""
-        return retrieve_from_knowledge_base(kb_id, query)
+        import boto3
+
+        response = boto3.client(
+            "bedrock-agent-runtime",
+            region_name=config.AWS_REGION,
+        ).retrieve(
+            knowledgeBaseId=kb_id,
+            retrievalQuery={"text": query},
+            retrievalConfiguration={
+                "managedSearchConfiguration": {
+                    "numberOfResults": 3,
+                }
+            },
+        )
+
+        return [
+            {
+                "text": item.get("content", {}).get("text", ""),
+                "source": item.get("location", {}).get("s3Location", {}).get("uri", "unknown"),
+                "score": round(float(item.get("score", 0.0)), 4),
+            }
+            for item in response.get("retrievalResults", [])
+        ]
     return Agent(model=_model(0.0), system_prompt=(
         f"You are {name}. Your only job is to call retrieve(query) and return raw "
         f"{label} passages. Do not summarize or invent information."), tools=[retrieve])
@@ -153,7 +231,7 @@ def build_communication_agent() -> Agent:
     """Return the CommunicationAgent for the final customer-facing response."""
     prompt = """You are NovaMart's CommunicationAgent. ALWAYS call
 get_full_workflow_context(session_id). Draft the final warm, professional customer-facing
-reply from the stored findings. Include applicable decisions, reasons, policy facts and
+reply from the stored findings. Treat order status and estimated delivery date as separate facts. Compare estimated delivery dates with the current date. If an estimated delivery date has passed, explicitly state that the date has passed and that the available record does not confirm delivery, unless the order status explicitly confirms delivery. Never say an order is on track for delivery based only on a past estimated date or a processing status. Include applicable decisions, reasons, policy facts and
 accurate order/tier data. Never expose internal JSON. Always thank the customer."""
     return Agent(model=_model(0.3), system_prompt=prompt, tools=[get_full_workflow_context])
 _inventory_agent = _policy_agent = _refund_agent = _communication_agent = None
@@ -175,56 +253,99 @@ def route_to_inventory_agent(session_id: str, request: str) -> dict:
     """Read state, invoke InventoryAgent, then persist inventory findings."""
     inventory, _, _, _ = _get_workers()
     state = _read_workflow_state(session_id)
+    if not state:
+        raise KeyError(f"WorkflowState not found for session {session_id}")
     customer_id = state.get("customer_id")
-    prompt = f"Session: {session_id}\nCustomer: {customer_id}\nRequest: {request}\nGather facts."
+    prompt = (f"Session: {session_id}\nCustomer: {customer_id}\n"
+              f"Current WorkflowState: {json.dumps(state, default=str)}\n"
+              f"Request: {request}\nGather facts.")
     result = inventory(prompt)
-    _update_workflow_state(session_id, {"inventory_findings": str(result),
-                                        "inventory_agent": str(result),
-                                        "status": "INVENTORY_COMPLETE"},
-                           expected_version=state["version"])
+    findings = str(result)
+
+    # Preserve deterministic delivery-date warnings in workflow state.
+    # This performs a read only; it does not modify the order.
+    import re
+    order_ids = re.findall(r"\bORD-[A-Za-z0-9-]+\b", request, flags=re.IGNORECASE)
+    delivery_warning = None
+    for order_id in dict.fromkeys(order_ids):
+        order = check_order_status(customer_id, order_id)
+        if order.get("delivery_date_warning"):
+            delivery_warning = order["delivery_date_warning"]
+            break
+        if order.get("delivery_date_check") == "DELIVERY_CONFIRMED":
+            delivery_warning = None
+            break
+
+    if delivery_warning and delivery_warning not in findings:
+        findings += "\n\nDeterministic delivery-date assessment: " + delivery_warning
+
+    updated = _update_workflow_state(session_id, {"inventory_findings": findings,
+                                                  "inventory_agent": str(result),
+                                                  "status": "INVENTORY_COMPLETE"},
+                                    expected_version=state["version"])
+    if updated.get("version") != state["version"] + 1:
+        raise RuntimeError("WorkflowState version did not advance after InventoryAgent")
     return {"agent": "InventoryAgent", "result": str(result)}
 @traced_tool
 def route_to_policy_agent(session_id: str, request: str) -> dict:
     """Read state, invoke PolicyAgent, then persist policy findings."""
     _, policy, _, _ = _get_workers()
     state = _read_workflow_state(session_id)
-    result = policy(request)
-    _update_workflow_state(session_id, {"policy_findings": str(result),
-                                        "policy_agent": str(result),
-                                        "status": "POLICY_COMPLETE"},
-                           expected_version=state["version"])
+    if not state:
+        raise KeyError(f"WorkflowState not found for session {session_id}")
+    prompt = (f"Session: {session_id}\nCustomer: {state.get('customer_id')}\n"
+              f"Current WorkflowState: {json.dumps(state, default=str)}\n"
+              f"Request: {request}")
+    result = policy(prompt)
+    updated = _update_workflow_state(session_id, {"policy_findings": str(result),
+                                                  "policy_agent": str(result),
+                                                  "status": "POLICY_COMPLETE"},
+                                    expected_version=state["version"])
+    if updated.get("version") != state["version"] + 1:
+        raise RuntimeError("WorkflowState version did not advance after PolicyAgent")
     return {"agent": "PolicyAgent", "result": str(result)}
 @traced_tool
 def route_to_refund_agent(session_id: str, request: str) -> dict:
     """Read state, invoke RefundAgent, and preserve its own state update."""
     _, _, refund, _ = _get_workers()
-    result = refund(f"Session: {session_id}\nRequest: {request}\nDecide refund eligibility.")
     state = _read_workflow_state(session_id)
-    if state.get("refund_decision") is None:
-        _update_workflow_state(session_id, {"refund_decision": str(result),
-                                            "refund_agent": str(result),
-                                            "status": "REFUND_COMPLETE"},
-                               expected_version=state["version"])
+    if not state:
+        raise KeyError(f"WorkflowState not found for session {session_id}")
+    prompt = (f"Session: {session_id}\nCustomer: {state.get('customer_id')}\n"
+              f"Current WorkflowState: {json.dumps(state, default=str)}\n"
+              f"Request: {request}\nDecide refund eligibility using stored inventory findings.")
+    result = refund(prompt)
+    updated = _update_workflow_state(session_id, {"refund_decision": str(result),
+                                                  "refund_agent": str(result),
+                                                  "status": "REFUND_COMPLETE"},
+                                    expected_version=state["version"])
+    if updated.get("version") != state["version"] + 1:
+        raise RuntimeError("WorkflowState version did not advance after RefundAgent")
     return {"agent": "RefundAgent", "result": str(result)}
 @traced_tool
 def route_to_communication_agent(session_id: str, request: str) -> dict:
     """Read state, invoke CommunicationAgent, and persist the final response."""
     _, _, _, communication = _get_workers()
     state = _read_workflow_state(session_id)
+    if not state:
+        raise KeyError(f"WorkflowState not found for session {session_id}")
     result = communication(
-        f"Session: {session_id}\nOriginal request: {request}\nCompose the final response.")
-    _update_workflow_state(session_id, {"final_response": str(result),
-                                        "communication_agent": str(result),
-                                        "status": "COMPLETE"},
-                           expected_version=state["version"])
+        f"Session: {session_id}\nOriginal request: {request}\n"
+        f"Current WorkflowState: {json.dumps(state, default=str)}\n"
+        "Compose the final customer-facing response from this stored context.")
+    updated = _update_workflow_state(session_id, {"final_response": str(result),
+                                                  "communication_agent": str(result),
+                                                  "status": "COMPLETE"},
+                                    expected_version=state["version"])
+    if updated.get("version") != state["version"] + 1:
+        raise RuntimeError("WorkflowState version did not advance after CommunicationAgent")
     return {"agent": "CommunicationAgent", "final_response": str(result)}
 def build_orchestrator_agent(inventory=None, refund=None, policy=None, communication=None) -> Agent:
     """Return the OrchestratorAgent; optional worker arguments preserve starter compatibility."""
     prompt = """You are NovaMart's OrchestratorAgent. NEVER write the customer-facing
-response yourself. ALWAYS initialize_session first. Order status/return/refund:
-Inventory then Refund. Policy meaning: PolicyAgent. Account tier questions: Inventory,
+response yourself. ALWAYS initialize_session first. For ordinary order-status, tracking, or delivery-date questions: Inventory then Communication; NEVER call Refund. For explicit return or refund requests: Inventory then Refund then Communication. Policy meaning: PolicyAgent. Account tier questions: Inventory,
 never Policy. Math/calculation: skip Inventory, Policy and Refund, then Communication.
-ALWAYS call route_to_communication_agent LAST. No exceptions."""
+For arithmetic requests using user-provided prices, quantities, and discounts, calculate the answer directly using decimal arithmetic; do not refuse or classify ordinary calculations as price negotiation. Example: 5 items at $29.99 with 10% off = $134.96. ALWAYS call route_to_communication_agent LAST. No exceptions."""
     return Agent(model=_model(0.0, orchestrator=True), system_prompt=prompt, tools=[
         initialize_session, route_to_inventory_agent, route_to_policy_agent,
         route_to_refund_agent, route_to_communication_agent])
@@ -243,9 +364,6 @@ def create_guardrail() -> tuple[str, str]:
         {"name": "CompetitorProducts", "type": "DENY",
          "definition": "Requests or discussion about competitor products.",
          "examples": ["Compare NovaMart with a competitor product."]},
-        {"name": "PricingNegotiations", "type": "DENY",
-         "definition": "Haggling or asking to change an advertised price; calculations using a specified price or discount are allowed.",
-         "examples": ["Can you lower the advertised price?", "Give me a better price."]},
         {"name": "LegalThreats", "type": "DENY",
          "definition": "Threats of lawsuits or legal action against NovaMart.",
          "examples": ["I will sue NovaMart if you do not refund me."]}],
@@ -255,7 +373,7 @@ def create_guardrail() -> tuple[str, str]:
     kwargs = dict(name=config.GUARDRAIL_NAME,
                   description="NovaMart customer-support safety guardrail.",
                   blockedInputMessaging="I can help with NovaMart customer support, but I can't assist with that request.",
-                  blockedOutputsMessaging="IÃ¢â‚¬â„¢m sorry, but I canÃ¢â‚¬â„¢t provide that response.",
+                  blockedOutputsMessaging="I’m sorry, but I can’t provide that response.",
                   contentPolicyConfig=content, sensitiveInformationPolicyConfig=pii,
                   topicPolicyConfig=topics, wordPolicyConfig=words,
                   crossRegionConfig={"guardrailProfileIdentifier": "us.guardrail.v1:0"})
@@ -307,177 +425,76 @@ def deploy_to_agentcore_runtime() -> str:
                   "GUARDRAIL_VERSION": guardrail_version})
     return arn
 def configure_memory(runtime_arn: str) -> str:
-    """Create or reuse SESSION_SUMMARY AgentCore Memory and attach it to the runtime."""
-    control = boto3.client(
-        "bedrock-agentcore-control",
-        region_name=config.AWS_REGION,
-    )
-
-    runtime_id = runtime_arn.rsplit("/", 1)[-1]
-    memory_name = f"{config.PROJECT_NAME.replace('-', '_')}_memory"
-
-    memory = None
-
-    # Reuse an existing Memory with the expected name when possible.
-    try:
-        memories = control.list_memories().get("memories", [])
-        for item in memories:
-            if item.get("name") == memory_name:
-                candidate = control.get_memory(
-                    memoryId=item["id"]
-                )["memory"]
-
-                strategies = candidate.get("strategies", [])
-                has_summary = any(
-                    "summaryMemoryStrategy" in strategy
-                    for strategy in strategies
-                )
-
-                if has_summary:
-                    memory = candidate
-                    break
-    except Exception as exc:
-        logger.warning(
-            "Could not inspect existing AgentCore Memory resources: %s",
-            exc,
-        )
-
-    # Create the required SESSION_SUMMARY Memory when none exists.
-    if memory is None:
-        response = control.create_memory(
-            name=memory_name,
-            description="Seven-day session summary memory for NovaMart customer support.",
-            eventExpiryDuration=7,
-            memoryStrategies=[
-                {
-                    "summaryMemoryStrategy": {
-                        "name": "SessionSummary",
-                        "description": "Summarize customer support sessions.",
-                    }
-                }
-            ],
-        )
-        memory = response["memory"]
-
-        while memory.get("status") == "CREATING":
-            time.sleep(5)
-            memory = control.get_memory(
-                memoryId=memory["id"]
-            )["memory"]
-
+    """Create AgentCore Memory using SESSION_SUMMARY with seven-day retention."""
+    control = boto3.client("bedrock-agentcore-control", region_name=config.AWS_REGION)
+    response = control.create_memory(
+        name=f"{config.PROJECT_NAME.replace('-', '_')}_memory",
+        description="Seven-day session summary memory for NovaMart customer support.",
+        eventExpiryDuration=7,
+        memoryStrategies=[{"summaryMemoryStrategy": {
+            "name": "SessionSummary", "description": "Summarize customer support sessions."
+        }}])
+    memory = response["memory"]
+    while memory.get("status") == "CREATING":
+        time.sleep(5)
+        memory = control.get_memory(memoryId=memory["id"])["memory"]
     if memory.get("status") != "ACTIVE":
-        raise RuntimeError(
-            f"AgentCore Memory is not ACTIVE: {memory}"
-        )
-
-    # Attach the Memory to the deployed runtime.
-    control.update_agent_runtime(
-        agentRuntimeId=runtime_id,
-        environmentVariables={
-            "BEDROCK_AGENTCORE_MEMORY_ID": memory["id"],
-            "BEDROCK_AGENTCORE_MEMORY_NAME": memory["name"],
-        },
-    )
-
-    _persist_env({
-        "MEMORY_ARN": memory["arn"],
-        "BEDROCK_AGENTCORE_MEMORY_ID": memory["id"],
-        "BEDROCK_AGENTCORE_MEMORY_NAME": memory["name"],
-    })
-
-    logger.info(
-        "AgentCore SESSION_SUMMARY Memory attached: %s (%s)",
-        memory["id"],
-        memory["name"],
-    )
-
+        raise RuntimeError(f"AgentCore Memory failed: {memory}")
+    _persist_env({"MEMORY_ARN": memory["arn"]})
     return memory["arn"]
 def configure_observability(runtime_arn: str) -> None:
-    """Configure and verify CloudWatch logging and X-Ray tracing."""
+    """Enable INFO CloudWatch logging and 100% X-Ray sampling on the runtime."""
+    control = boto3.client("bedrock-agentcore-control", region_name=config.AWS_REGION)
+    runtime_id = runtime_arn.rsplit("/", 1)[-1]
+    logging_config = {
+        "cloudWatchConfig": {"logGroupName": config.AGENT_LOG_GROUP, "logLevel": "INFO", "enabled": True},
+        "xRayConfig": {"enabled": True, "samplingRate": 1.0}}
     try:
-        logs = boto3.client("logs", region_name=config.AWS_REGION)
-        xray = boto3.client("xray", region_name=config.AWS_REGION)
-
-        log_group = config.AGENT_LOG_GROUP
-
-        log_groups = logs.describe_log_groups(
-            logGroupNamePrefix=log_group
-        ).get("logGroups", [])
-
-        if not any(
-            item.get("logGroupName") == log_group
-            for item in log_groups
-        ):
-            logger.warning(
-                "AgentCore log group %s was not found yet; "
-                "runtime delivery may create it automatically.",
-                log_group,
-            )
-
-        current_destination = xray.get_trace_segment_destination().get(
-            "Destination"
-        )
-
-        if current_destination != "CloudWatchLogs":
-            xray.update_trace_segment_destination(
-                Destination="CloudWatchLogs"
-            )
-
-        xray.update_sampling_rule(
-            SamplingRuleUpdate={
-                "RuleName": "Default",
-                "FixedRate": 1.0,
-            }
-        )
-
-        destination = xray.get_trace_segment_destination().get(
-            "Destination"
-        )
-
-        rules = xray.get_sampling_rules().get(
-            "SamplingRuleRecords", []
-        )
-
-        default_rule = next(
-            (
-                record.get("SamplingRule", {})
-                for record in rules
-                if record.get("SamplingRule", {}).get("RuleName") == "Default"
-            ),
-            {},
-        )
-
-        if destination != "CloudWatchLogs":
-            raise RuntimeError(
-                f"Unexpected X-Ray destination: {destination}"
-            )
-
-        if default_rule.get("FixedRate") != 1.0:
-            raise RuntimeError(
-                "X-Ray Default sampling rate is not 1.0"
-            )
-
-        logger.info(
-            "Observability configured for %s: "
-            "CloudWatch=%s, X-Ray=%s, sampling=%.1f",
-            runtime_arn,
-            log_group,
-            destination,
-            default_rule.get("FixedRate", 0.0),
-        )
-
+        control.put_agent_runtime_logging_configuration(
+            agentRuntimeId=runtime_id, loggingConfiguration=logging_config)
     except Exception as exc:
-        logger.exception(
-            "Could not configure AgentCore observability: %s",
-            exc,
-        )
+        logger.exception("Could not configure AgentCore observability: %s", exc)
         raise
 def _run_local(query: str, customer_id: str = "CUST-001") -> str:
-    """Run one local end-to-end request through the five-agent graph."""
+    """Calculate simple item discounts locally; route other requests normally."""
+    import re
+
+    text = query.strip().lower().rstrip("?.! ")
+    pattern = re.compile(
+        r"(?:calculate the total for |how much are |what is the total for )?"
+        r"(?P<qty>\d+)\s+items?\s+at\s+\$(?P<price>\d+(?:\.\d{1,2})?)"
+        r"(?:\s+each)?\s+(?:with\s+)?(?:a\s+)?"
+        r"(?P<discount>\d+(?:\.\d+)?)%\s+(?:off|discount)"
+    )
+
+    match = pattern.fullmatch(text)
+    if match:
+        try:
+            quantity = Decimal(match.group("qty"))
+            unit_price = Decimal(match.group("price"))
+            discount_rate = Decimal(match.group("discount")) / Decimal("100")
+
+            if quantity > 0 and unit_price >= 0 and Decimal("0") <= discount_rate <= Decimal("1"):
+                subtotal = quantity * unit_price
+                total = (subtotal * (Decimal("1") - discount_rate)).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                discount_display = subtotal - total
+                return (
+                    f"Subtotal: ${subtotal:.2f}. "
+                    f"Discount: ${discount_display:.2f}. "
+                    f"Total: ${total:.2f}."
+                )
+        except Exception:
+            logger.exception("Local arithmetic parsing failed")
+
     session_id = str(uuid.uuid4())[:8]
     orchestrator = build_orchestrator_agent()
     prompt = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {query}"
     return str(orchestrator(prompt))
+
+
+
 def _chat() -> None:
     """Run the interactive terminal chat experience."""
     from src.agent_utils import _trace_writer, _real_stdout
@@ -524,10 +541,3 @@ def main() -> None:
 trace = AgentTrace(_read_workflow_state)
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-

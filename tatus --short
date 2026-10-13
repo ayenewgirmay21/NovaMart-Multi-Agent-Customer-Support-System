@@ -1,0 +1,573 @@
+[1mdiff --git a/src/agent_orchestrator.py b/src/agent_orchestrator.py[m
+[1mindex f8ef92e..6492136 100644[m
+[1m--- a/src/agent_orchestrator.py[m
+[1m+++ b/src/agent_orchestrator.py[m
+[36m@@ -1,26 +1,21 @@[m
+[31m-﻿import json[m
+[32m+[m[32mimport json[m
+ import logging[m
+ import os[m
+ import sys[m
+ import time[m
+[31m-from pathlib import Path[m
+[31m-if str(Path(__file__).resolve().parent) not in sys.path:[m
+[31m-    sys.path.insert(0, str(Path(__file__).resolve().parent))[m
+ import uuid[m
+[32m+[m[32mfrom decimal import Decimal, ROUND_HALF_UP[m
+[32m+[m[32mfrom datetime import date[m
+ import boto3[m
+ from concurrent.futures import ThreadPoolExecutor, as_completed[m
+ from typing import Any[m
+ from strands import Agent[m
+[31m-from opentelemetry import trace[m
+[31m-from strands.telemetry import StrandsTelemetry[m
+ from strands.models import BedrockModel[m
+ import config[m
+ from src.agent_utils import AgentTrace[m
+ from src.agent_observability import tool as traced_tool[m
+ from src.bedrock_kb_retrieval import retrieve_from_knowledge_base[m
+ logger = logging.getLogger(__name__)[m
+[31m-[m
+[31m-StrandsTelemetry(tracer_provider=trace.get_tracer_provider())[m
+ dynamodb = boto3.resource("dynamodb", region_name=config.AWS_REGION)[m
+ bedrock = boto3.client("bedrock", region_name=config.AWS_REGION)[m
+ orders_table = dynamodb.Table(config.ORDERS_TABLE)[m
+[36m@@ -55,21 +50,72 @@[m [mdef _update_workflow_state(session_id: str, updates: dict, expected_version: int[m
+         if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":[m
+             logger.warning("WorkflowState version conflict for %s", session_id)[m
+         raise[m
+[32m+[m[32mdef _apply_guardrail(model_kwargs: dict) -> dict:[m
+[32m+[m[32m    """Attach the configured published Bedrock Guardrail to every agent model.[m
+[32m+[m
+[32m+[m[32m    The same model factory is used by the Orchestrator, Inventory, Policy,[m
+[32m+[m[32m    Refund, Communication, and policy-retriever agents, so the safety settings[m
+[32m+[m[32m    cannot silently diverge between agent construction paths.[m
+[32m+[m[32m    """[m
+[32m+[m[32m    kwargs = dict(model_kwargs)[m
+[32m+[m[32m    guardrail_id = getattr(config, "GUARDRAIL_ID", "")[m
+[32m+[m[32m    guardrail_version = getattr(config, "GUARDRAIL_VERSION", "")[m
+[32m+[m[32m    if guardrail_id and guardrail_version:[m
+[32m+[m[32m        kwargs.update([m
+[32m+[m[32m            guardrail_id=guardrail_id,[m
+[32m+[m[32m            guardrail_version=guardrail_version,[m
+[32m+[m[32m            guardrail_trace="enabled",[m
+[32m+[m[32m        )[m
+[32m+[m[32m    return kwargs[m
+[32m+[m
+[32m+[m
+ def _model(temperature: float, orchestrator: bool = False) -> BedrockModel:[m
+[31m-    """Build a Bedrock model from the required config constants."""[m
+[32m+[m[32m    """Build a Bedrock model and consistently apply the configured guardrail."""[m
+     model_id = config.ORCHESTRATOR_MODEL_ID if orchestrator else config.WORKER_MODEL_ID[m
+[31m-    kwargs = {"model_id": model_id, "temperature": temperature}[m
+[31m-    if config.GUARDRAIL_ID and config.GUARDRAIL_VERSION not in ("", "DRAFT"):[m
+[31m-        kwargs.update(guardrail_id=config.GUARDRAIL_ID,[m
+[31m-                      guardrail_version=config.GUARDRAIL_VERSION,[m
+[31m-                      guardrail_trace="enabled")[m
+[32m+[m[32m    kwargs = _apply_guardrail({"model_id": model_id, "temperature": temperature})[m
+     return BedrockModel(**kwargs)[m
+[32m+[m[32mdef _annotate_delivery_date(item: dict, today: date | None = None) -> dict:[m
+[32m+[m[32m    """Return a copy of an order with a deterministic delivery-date assessment."""[m
+[32m+[m[32m    if not item:[m
+[32m+[m[32m        return item[m
+[32m+[m
+[32m+[m[32m    estimated_delivery = item.get("estimated_delivery")[m
+[32m+[m[32m    if not estimated_delivery:[m
+[32m+[m[32m        return dict(item)[m
+[32m+[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        delivery_date = date.fromisoformat(str(estimated_delivery)[:10])[m
+[32m+[m[32m    except (TypeError, ValueError):[m
+[32m+[m[32m        return dict(item)[m
+[32m+[m
+[32m+[m[32m    current_date = today or date.today()[m
+[32m+[m[32m    result = dict(item)[m
+[32m+[m[32m    result["delivery_date_checked_on"] = current_date.isoformat()[m
+[32m+[m
+[32m+[m[32m    if str(item.get("status", "")).strip().lower() == "delivered":[m
+[32m+[m[32m        result["delivery_date_check"] = "DELIVERY_CONFIRMED"[m
+[32m+[m[32m    elif delivery_date < current_date:[m
+[32m+[m[32m        result["delivery_date_check"] = "PAST_DUE_UNCONFIRMED"[m
+[32m+[m[32m        result["delivery_date_warning"] = ([m
+[32m+[m[32m            f"The estimated delivery date {delivery_date.isoformat()} has passed "[m
+[32m+[m[32m            f"as of {current_date.isoformat()}. The recorded order status is "[m
+[32m+[m[32m            f"'{item.get('status', 'unknown')}', and the available record does "[m
+[32m+[m[32m            "not confirm delivery."[m
+[32m+[m[32m        )[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        result["delivery_date_check"] = "NOT_PAST_DUE"[m
+[32m+[m
+[32m+[m[32m    return result[m
+[32m+[m
+[32m+[m
+ @traced_tool[m
+ def check_order_status(customer_id: str, order_id: str) -> dict:[m
+[31m-    """Look up an order's status, dates, amount and item details."""[m
+[32m+[m[32m    """Look up an order and assess its estimated delivery date without writing data."""[m
+     item = orders_table.get_item([m
+         Key={"customer_id": customer_id, "order_id": order_id}).get("Item")[m
+[31m-    return item or {"error": f"Order {order_id} not found for customer {customer_id}"}[m
+[32m+[m[32m    if not item:[m
+[32m+[m[32m        return {"error": f"Order {order_id} not found for customer {customer_id}"}[m
+[32m+[m[32m    return _annotate_delivery_date(item)[m
+ @traced_tool[m
+ def get_customer_tier(customer_id: str) -> dict:[m
+     """Retrieve the customer's Standard or Premium loyalty tier."""[m
+[36m@@ -91,10 +137,20 @@[m [mguess, or fabricate. Report returned dates, amounts, tiers and statuses accurate[m
+                  tools=[check_order_status, get_customer_tier, list_customer_orders])[m
+ @traced_tool[m
+ def get_inventory_context(session_id: str) -> dict:[m
+[31m-    """Read InventoryAgent findings from WorkflowState for a refund decision."""[m
+[32m+[m[32m    """Read inventory findings and order records for a refund decision."""[m
+     state = _read_workflow_state(session_id)[m
+[31m-    return {"session_id": session_id, "customer_id": state.get("customer_id"),[m
+[31m-            "inventory_findings": state.get("inventory_findings")}[m
+[32m+[m[32m    customer_id = state.get("customer_id")[m
+[32m+[m[32m    orders = ([m
+[32m+[m[32m        list_customer_orders(customer_id)[m
+[32m+[m[32m        if customer_id[m
+[32m+[m[32m        else {"error": "Customer ID is unavailable in WorkflowState"}[m
+[32m+[m[32m    )[m
+[32m+[m[32m    return {[m
+[32m+[m[32m        "session_id": session_id,[m
+[32m+[m[32m        "customer_id": customer_id,[m
+[32m+[m[32m        "inventory_findings": state.get("inventory_findings"),[m
+[32m+[m[32m        "customer_orders": orders,[m
+[32m+[m[32m    }[m
+ @traced_tool[m
+ def initiate_refund(session_id: str, order_id: str, customer_id: str,[m
+                     decision: str, reason: str) -> dict:[m
+[36m@@ -117,7 +173,29 @@[m [mdef _make_retriever_agent(name: str, kb_id: str, label: str) -> Agent:[m
+     @traced_tool[m
+     def retrieve(query: str) -> dict:[m
+         """Retrieve passages relevant to query from this policy knowledge base."""[m
+[31m-        return retrieve_from_knowledge_base(kb_id, query)[m
+[32m+[m[32m        import boto3[m
+[32m+[m
+[32m+[m[32m        response = boto3.client([m
+[32m+[m[32m            "bedrock-agent-runtime",[m
+[32m+[m[32m            region_name=config.AWS_REGION,[m
+[32m+[m[32m        ).retrieve([m
+[32m+[m[32m            knowledgeBaseId=kb_id,[m
+[32m+[m[32m            retrievalQuery={"text": query},[m
+[32m+[m[32m            retrievalConfiguration={[m
+[32m+[m[32m                "managedSearchConfiguration": {[m
+[32m+[m[32m                    "numberOfResults": 3,[m
+[32m+[m[32m                }[m
+[32m+[m[32m            },[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m        return [[m
+[32m+[m[32m            {[m
+[32m+[m[32m                "text": item.get("content", {}).get("text", ""),[m
+[32m+[m[32m                "source": item.get("location", {}).get("s3Location", {}).get("uri", "unknown"),[m
+[32m+[m[32m                "score": round(float(item.get("score", 0.0)), 4),[m
+[32m+[m[32m            }[m
+[32m+[m[32m            for item in response.get("retrievalResults", [])[m
+[32m+[m[32m        ][m
+     return Agent(model=_model(0.0), system_prompt=([m
+         f"You are {name}. Your only job is to call retrieve(query) and return raw "[m
+         f"{label} passages. Do not summarize or invent information."), tools=[retrieve])[m
+[36m@@ -153,7 +231,7 @@[m [mdef build_communication_agent() -> Agent:[m
+     """Return the CommunicationAgent for the final customer-facing response."""[m
+     prompt = """You are NovaMart's CommunicationAgent. ALWAYS call[m
+ get_full_workflow_context(session_id). Draft the final warm, professional customer-facing[m
+[31m-reply from the stored findings. Include applicable decisions, reasons, policy facts and[m
+[32m+[m[32mreply from the stored findings. Treat order status and estimated delivery date as separate facts. Compare estimated delivery dates with the current date. If an estimated delivery date has passed, explicitly state that the date has passed and that the available record does not confirm delivery, unless the order status explicitly confirms delivery. Never say an order is on track for delivery based only on a past estimated date or a processing status. Include applicable decisions, reasons, policy facts and[m
+ accurate order/tier data. Never expose internal JSON. Always thank the customer."""[m
+     return Agent(model=_model(0.3), system_prompt=prompt, tools=[get_full_workflow_context])[m
+ _inventory_agent = _policy_agent = _refund_agent = _communication_agent = None[m
+[36m@@ -175,56 +253,99 @@[m [mdef route_to_inventory_agent(session_id: str, request: str) -> dict:[m
+     """Read state, invoke InventoryAgent, then persist inventory findings."""[m
+     inventory, _, _, _ = _get_workers()[m
+     state = _read_workflow_state(session_id)[m
+[32m+[m[32m    if not state:[m
+[32m+[m[32m        raise KeyError(f"WorkflowState not found for session {session_id}")[m
+     customer_id = state.get("customer_id")[m
+[31m-    prompt = f"Session: {session_id}\nCustomer: {customer_id}\nRequest: {request}\nGather facts."[m
+[32m+[m[32m    prompt = (f"Session: {session_id}\nCustomer: {customer_id}\n"[m
+[32m+[m[32m              f"Current WorkflowState: {json.dumps(state, default=str)}\n"[m
+[32m+[m[32m              f"Request: {request}\nGather facts.")[m
+     result = inventory(prompt)[m
+[31m-    _update_workflow_state(session_id, {"inventory_findings": str(result),[m
+[31m-                                        "inventory_agent": str(result),[m
+[31m-                                        "status": "INVENTORY_COMPLETE"},[m
+[31m-                           expected_version=state["version"])[m
+[32m+[m[32m    findings = str(result)[m
+[32m+[m
+[32m+[m[32m    # Preserve deterministic delivery-date warnings in workflow state.[m
+[32m+[m[32m    # This performs a read only; it does not modify the order.[m
+[32m+[m[32m    import re[m
+[32m+[m[32m    order_ids = re.findall(r"\bORD-[A-Za-z0-9-]+\b", request, flags=re.IGNORECASE)[m
+[32m+[m[32m    delivery_warning = None[m
+[32m+[m[32m    for order_id in dict.fromkeys(order_ids):[m
+[32m+[m[32m        order = check_order_status(customer_id, order_id)[m
+[32m+[m[32m        if order.get("delivery_date_warning"):[m
+[32m+[m[32m            delivery_warning = order["delivery_date_warning"][m
+[32m+[m[32m            break[m
+[32m+[m[32m        if order.get("delivery_date_check") == "DELIVERY_CONFIRMED":[m
+[32m+[m[32m            delivery_warning = None[m
+[32m+[m[32m            break[m
+[32m+[m
+[32m+[m[32m    if delivery_warning and delivery_warning not in findings:[m
+[32m+[m[32m        findings += "\n\nDeterministic delivery-date assessment: " + delivery_warning[m
+[32m+[m
+[32m+[m[32m    updated = _update_workflow_state(session_id, {"inventory_findings": findings,[m
+[32m+[m[32m                                                  "inventory_agent": str(result),[m
+[32m+[m[32m                                                  "status": "INVENTORY_COMPLETE"},[m
+[32m+[m[32m                                    expected_version=state["version"])[m
+[32m+[m[32m    if updated.get("version") != state["version"] + 1:[m
+[32m+[m[32m        raise RuntimeError("WorkflowState version did not advance after InventoryAgent")[m
+     return {"agent": "InventoryAgent", "result": str(result)}[m
+ @traced_tool[m
+ def route_to_policy_agent(session_id: str, request: str) -> dict:[m
+     """Read state, invoke PolicyAgent, then persist policy findings."""[m
+     _, policy, _, _ = _get_workers()[m
+     state = _read_workflow_state(session_id)[m
+[31m-    result = policy(request)[m
+[31m-    _update_workflow_state(session_id, {"policy_findings": str(result),[m
+[31m-                                        "policy_agent": str(result),[m
+[31m-                                        "status": "POLICY_COMPLETE"},[m
+[31m-                           expected_version=state["version"])[m
+[32m+[m[32m    if not state:[m
+[32m+[m[32m        raise KeyError(f"WorkflowState not found for session {session_id}")[m
+[32m+[m[32m    prompt = (f"Session: {session_id}\nCustomer: {state.get('customer_id')}\n"[m
+[32m+[m[32m              f"Current WorkflowState: {json.dumps(state, default=str)}\n"[m
+[32m+[m[32m              f"Request: {request}")[m
+[32m+[m[32m    result = policy(prompt)[m
+[32m+[m[32m    updated = _update_workflow_state(session_id, {"policy_findings": str(result),[m
+[32m+[m[32m                                                  "policy_agent": str(result),[m
+[32m+[m[32m                                                  "status": "POLICY_COMPLETE"},[m
+[32m+[m[32m                                    expected_version=state["version"])[m
+[32m+[m[32m    if updated.get("version") != state["version"] + 1:[m
+[32m+[m[32m        raise RuntimeError("WorkflowState version did not advance after PolicyAgent")[m
+     return {"agent": "PolicyAgent", "result": str(result)}[m
+ @traced_tool[m
+ def route_to_refund_agent(session_id: str, request: str) -> dict:[m
+     """Read state, invoke RefundAgent, and preserve its own state update."""[m
+     _, _, refund, _ = _get_workers()[m
+[31m-    result = refund(f"Session: {session_id}\nRequest: {request}\nDecide refund eligibility.")[m
+     state = _read_workflow_state(session_id)[m
+[31m-    if state.get("refund_decision") is None:[m
+[31m-        _update_workflow_state(session_id, {"refund_decision": str(result),[m
+[31m-                                            "refund_agent": str(result),[m
+[31m-                                            "status": "REFUND_COMPLETE"},[m
+[31m-                               expected_version=state["version"])[m
+[32m+[m[32m    if not state:[m
+[32m+[m[32m        raise KeyError(f"WorkflowState not found for session {session_id}")[m
+[32m+[m[32m    prompt = (f"Session: {session_id}\nCustomer: {state.get('customer_id')}\n"[m
+[32m+[m[32m              f"Current WorkflowState: {json.dumps(state, default=str)}\n"[m
+[32m+[m[32m              f"Request: {request}\nDecide refund eligibility using stored inventory findings.")[m
+[32m+[m[32m    result = refund(prompt)[m
+[32m+[m[32m    updated = _update_workflow_state(session_id, {"refund_decision": str(result),[m
+[32m+[m[32m                                                  "refund_agent": str(result),[m
+[32m+[m[32m                                                  "status": "REFUND_COMPLETE"},[m
+[32m+[m[32m                                    expected_version=state["version"])[m
+[32m+[m[32m    if updated.get("version") != state["version"] + 1:[m
+[32m+[m[32m        raise RuntimeError("WorkflowState version did not advance after RefundAgent")[m
+     return {"agent": "RefundAgent", "result": str(result)}[m
+ @traced_tool[m
+ def route_to_communication_agent(session_id: str, request: str) -> dict:[m
+     """Read state, invoke CommunicationAgent, and persist the final response."""[m
+     _, _, _, communication = _get_workers()[m
+     state = _read_workflow_state(session_id)[m
+[32m+[m[32m    if not state:[m
+[32m+[m[32m        raise KeyError(f"WorkflowState not found for session {session_id}")[m
+     result = communication([m
+[31m-        f"Session: {session_id}\nOriginal request: {request}\nCompose the final response.")[m
+[31m-    _update_workflow_state(session_id, {"final_response": str(result),[m
+[31m-                                        "communication_agent": str(result),[m
+[31m-                                        "status": "COMPLETE"},[m
+[31m-                           expected_version=state["version"])[m
+[32m+[m[32m        f"Session: {session_id}\nOriginal request: {request}\n"[m
+[32m+[m[32m        f"Current WorkflowState: {json.dumps(state, default=str)}\n"[m
+[32m+[m[32m        "Compose the final customer-facing response from this stored context.")[m
+[32m+[m[32m    updated = _update_workflow_state(session_id, {"final_response": str(result),[m
+[32m+[m[32m                                                  "communication_agent": str(result),[m
+[32m+[m[32m                                                  "status": "COMPLETE"},[m
+[32m+[m[32m                                    expected_version=state["version"])[m
+[32m+[m[32m    if updated.get("version") != state["version"] + 1:[m
+[32m+[m[32m        raise RuntimeError("WorkflowState version did not advance after CommunicationAgent")[m
+     return {"agent": "CommunicationAgent", "final_response": str(result)}[m
+ def build_orchestrator_agent(inventory=None, refund=None, policy=None, communication=None) -> Agent:[m
+     """Return the OrchestratorAgent; optional worker arguments preserve starter compatibility."""[m
+     prompt = """You are NovaMart's OrchestratorAgent. NEVER write the customer-facing[m
+[31m-response yourself. ALWAYS initialize_session first. Order status/return/refund:[m
+[31m-Inventory then Refund. Policy meaning: PolicyAgent. Account tier questions: Inventory,[m
+[32m+[m[32mresponse yourself. ALWAYS initialize_session first. For ordinary order-status, tracking, or delivery-date questions: Inventory then Communication; NEVER call Refund. For explicit return or refund requests: Inventory then Refund then Communication. Policy meaning: PolicyAgent. Account tier questions: Inventory,[m
+ never Policy. Math/calculation: skip Inventory, Policy and Refund, then Communication.[m
+[31m-ALWAYS call route_to_communication_agent LAST. No exceptions."""[m
+[32m+[m[32mFor arithmetic requests using user-provided prices, quantities, and discounts, calculate the answer directly using decimal arithmetic; do not refuse or classify ordinary calculations as price negotiation. Example: 5 items at $29.99 with 10% off = $134.96. ALWAYS call route_to_communication_agent LAST. No exceptions."""[m
+     return Agent(model=_model(0.0, orchestrator=True), system_prompt=prompt, tools=[[m
+         initialize_session, route_to_inventory_agent, route_to_policy_agent,[m
+         route_to_refund_agent, route_to_communication_agent])[m
+[36m@@ -243,9 +364,6 @@[m [mdef create_guardrail() -> tuple[str, str]:[m
+         {"name": "CompetitorProducts", "type": "DENY",[m
+          "definition": "Requests or discussion about competitor products.",[m
+          "examples": ["Compare NovaMart with a competitor product."]},[m
+[31m-        {"name": "PricingNegotiations", "type": "DENY",[m
+[31m-         "definition": "Haggling or asking to change an advertised price; calculations using a specified price or discount are allowed.",[m
+[31m-         "examples": ["Can you lower the advertised price?", "Give me a better price."]},[m
+         {"name": "LegalThreats", "type": "DENY",[m
+          "definition": "Threats of lawsuits or legal action against NovaMart.",[m
+          "examples": ["I will sue NovaMart if you do not refund me."]}],[m
+[36m@@ -255,7 +373,7 @@[m [mdef create_guardrail() -> tuple[str, str]:[m
+     kwargs = dict(name=config.GUARDRAIL_NAME,[m
+                   description="NovaMart customer-support safety guardrail.",[m
+                   blockedInputMessaging="I can help with NovaMart customer support, but I can't assist with that request.",[m
+[31m-                  blockedOutputsMessaging="IÃ¢â‚¬â„¢m sorry, but I canÃ¢â‚¬â„¢t provide that response.",[m
+[32m+[m[32m                  blockedOutputsMessaging="I’m sorry, but I can’t provide that response.",[m
+                   contentPolicyConfig=content, sensitiveInformationPolicyConfig=pii,[m
+                   topicPolicyConfig=topics, wordPolicyConfig=words,[m
+                   crossRegionConfig={"guardrailProfileIdentifier": "us.guardrail.v1:0"})[m
+[36m@@ -307,177 +425,76 @@[m [mdef deploy_to_agentcore_runtime() -> str:[m
+                   "GUARDRAIL_VERSION": guardrail_version})[m
+     return arn[m
+ def configure_memory(runtime_arn: str) -> str:[m
+[31m-    """Create or reuse SESSION_SUMMARY AgentCore Memory and attach it to the runtime."""[m
+[31m-    control = boto3.client([m
+[31m-        "bedrock-agentcore-control",[m
+[31m-        region_name=config.AWS_REGION,[m
+[31m-    )[m
+[31m-[m
+[31m-    runtime_id = runtime_arn.rsplit("/", 1)[-1][m
+[31m-    memory_name = f"{config.PROJECT_NAME.replace('-', '_')}_memory"[m
+[31m-[m
+[31m-    memory = None[m
+[31m-[m
+[31m-    # Reuse an existing Memory with the expected name when possible.[m
+[31m-    try:[m
+[31m-        memories = control.list_memories().get("memories", [])[m
+[31m-        for item in memories:[m
+[31m-            if item.get("name") == memory_name:[m
+[31m-                candidate = control.get_memory([m
+[31m-                    memoryId=item["id"][m
+[31m-                )["memory"][m
+[31m-[m
+[31m-                strategies = candidate.get("strategies", [])[m
+[31m-                has_summary = any([m
+[31m-                    "summaryMemoryStrategy" in strategy[m
+[31m-                    for strategy in strategies[m
+[31m-                )[m
+[31m-[m
+[31m-                if has_summary:[m
+[31m-                    memory = candidate[m
+[31m-                    break[m
+[31m-    except Exception as exc:[m
+[31m-        logger.warning([m
+[31m-            "Could not inspect existing AgentCore Memory resources: %s",[m
+[31m-            exc,[m
+[31m-        )[m
+[31m-[m
+[31m-    # Create the required SESSION_SUMMARY Memory when none exists.[m
+[31m-    if memory is None:[m
+[31m-        response = control.create_memory([m
+[31m-            name=memory_name,[m
+[31m-            description="Seven-day session summary memory for NovaMart customer support.",[m
+[31m-            eventExpiryDuration=7,[m
+[31m-            memoryStrategies=[[m
+[31m-                {[m
+[31m-                    "summaryMemoryStrategy": {[m
+[31m-                        "name": "SessionSummary",[m
+[31m-                        "description": "Summarize customer support sessions.",[m
+[31m-                    }[m
+[31m-                }[m
+[31m-            ],[m
+[31m-        )[m
+[31m-        memory = response["memory"][m
+[31m-[m
+[31m-        while memory.get("status") == "CREATING":[m
+[31m-            time.sleep(5)[m
+[31m-            memory = control.get_memory([m
+[31m-                memoryId=memory["id"][m
+[31m-            )["memory"][m
+[31m-[m
+[32m+[m[32m    """Create AgentCore Memory using SESSION_SUMMARY with seven-day retention."""[m
+[32m+[m[32m    control = boto3.client("bedrock-agentcore-control", region_name=config.AWS_REGION)[m
+[32m+[m[32m    response = control.create_memory([m
+[32m+[m[32m        name=f"{config.PROJECT_NAME.replace('-', '_')}_memory",[m
+[32m+[m[32m        description="Seven-day session summary memory for NovaMart customer support.",[m
+[32m+[m[32m        eventExpiryDuration=7,[m
+[32m+[m[32m        memoryStrategies=[{"summaryMemoryStrategy": {[m
+[32m+[m[32m            "name": "SessionSummary", "description": "Summarize customer support sessions."[m
+[32m+[m[32m        }}])[m
+[32m+[m[32m    memory = response["memory"][m
+[32m+[m[32m    while memory.get("status") == "CREATING":[m
+[32m+[m[32m        time.sleep(5)[m
+[32m+[m[32m        memory = control.get_memory(memoryId=memory["id"])["memory"][m
+     if memory.get("status") != "ACTIVE":[m
+[31m-        raise RuntimeError([m
+[31m-            f"AgentCore Memory is not ACTIVE: {memory}"[m
+[31m-        )[m
+[31m-[m
+[31m-    # Attach the Memory to the deployed runtime.[m
+[31m-    control.update_agent_runtime([m
+[31m-        agentRuntimeId=runtime_id,[m
+[31m-        environmentVariables={[m
+[31m-            "BEDROCK_AGENTCORE_MEMORY_ID": memory["id"],[m
+[31m-            "BEDROCK_AGENTCORE_MEMORY_NAME": memory["name"],[m
+[31m-        },[m
+[31m-    )[m
+[31m-[m
+[31m-    _persist_env({[m
+[31m-        "MEMORY_ARN": memory["arn"],[m
+[31m-        "BEDROCK_AGENTCORE_MEMORY_ID": memory["id"],[m
+[31m-        "BEDROCK_AGENTCORE_MEMORY_NAME": memory["name"],[m
+[31m-    })[m
+[31m-[m
+[31m-    logger.info([m
+[31m-        "AgentCore SESSION_SUMMARY Memory attached: %s (%s)",[m
+[31m-        memory["id"],[m
+[31m-        memory["name"],[m
+[31m-    )[m
+[31m-[m
+[32m+[m[32m        raise RuntimeError(f"AgentCore Memory failed: {memory}")[m
+[32m+[m[32m    _persist_env({"MEMORY_ARN": memory["arn"]})[m
+     return memory["arn"][m
+ def configure_observability(runtime_arn: str) -> None:[m
+[31m-    """Configure and verify CloudWatch logging and X-Ray tracing."""[m
+[32m+[m[32m    """Enable INFO CloudWatch logging and 100% X-Ray sampling on the runtime."""[m
+[32m+[m[32m    control = boto3.client("bedrock-agentcore-control", region_name=config.AWS_REGION)[m
+[32m+[m[32m    runtime_id = runtime_arn.rsplit("/", 1)[-1][m
+[32m+[m[32m    logging_config = {[m
+[32m+[m[32m        "cloudWatchConfig": {"logGroupName": config.AGENT_LOG_GROUP, "logLevel": "INFO", "enabled": True},[m
+[32m+[m[32m        "xRayConfig": {"enabled": True, "samplingRate": 1.0}}[m
+     try:[m
+[31m-        logs = boto3.client("logs", region_name=config.AWS_REGION)[m
+[31m-        xray = boto3.client("xray", region_name=config.AWS_REGION)[m
+[31m-[m
+[31m-        log_group = config.AGENT_LOG_GROUP[m
+[31m-[m
+[31m-        log_groups = logs.describe_log_groups([m
+[31m-            logGroupNamePrefix=log_group[m
+[31m-        ).get("logGroups", [])[m
+[31m-[m
+[31m-        if not any([m
+[31m-            item.get("logGroupName") == log_group[m
+[31m-            for item in log_groups[m
+[31m-        ):[m
+[31m-            logger.warning([m
+[31m-                "AgentCore log group %s was not found yet; "[m
+[31m-                "runtime delivery may create it automatically.",[m
+[31m-                log_group,[m
+[31m-            )[m
+[31m-[m
+[31m-        current_destination = xray.get_trace_segment_destination().get([m
+[31m-            "Destination"[m
+[31m-        )[m
+[31m-[m
+[31m-        if current_destination != "CloudWatchLogs":[m
+[31m-            xray.update_trace_segment_destination([m
+[31m-                Destination="CloudWatchLogs"[m
+[31m-            )[m
+[31m-[m
+[31m-        xray.update_sampling_rule([m
+[31m-            SamplingRuleUpdate={[m
+[31m-                "RuleName": "Default",[m
+[31m-                "FixedRate": 1.0,[m
+[31m-            }[m
+[31m-        )[m
+[31m-[m
+[31m-        destination = xray.get_trace_segment_destination().get([m
+[31m-            "Destination"[m
+[31m-        )[m
+[31m-[m
+[31m-        rules = xray.get_sampling_rules().get([m
+[31m-            "SamplingRuleRecords", [][m
+[31m-        )[m
+[31m-[m
+[31m-        default_rule = next([m
+[31m-            ([m
+[31m-                record.get("SamplingRule", {})[m
+[31m-                for record in rules[m
+[31m-                if record.get("SamplingRule", {}).get("RuleName") == "Default"[m
+[31m-            ),[m
+[31m-            {},[m
+[31m-        )[m
+[31m-[m
+[31m-        if destination != "CloudWatchLogs":[m
+[31m-            raise RuntimeError([m
+[31m-                f"Unexpected X-Ray destination: {destination}"[m
+[31m-            )[m
+[31m-[m
+[31m-        if default_rule.get("FixedRate") != 1.0:[m
+[31m-            raise RuntimeError([m
+[31m-                "X-Ray Default sampling rate is not 1.0"[m
+[31m-            )[m
+[31m-[m
+[31m-        logger.info([m
+[31m-            "Observability configured for %s: "[m
+[31m-            "CloudWatch=%s, X-Ray=%s, sampling=%.1f",[m
+[31m-            runtime_arn,[m
+[31m-            log_group,[m
+[31m-            destination,[m
+[31m-            default_rule.get("FixedRate", 0.0),[m
+[31m-        )[m
+[31m-[m
+[32m+[m[32m        control.put_agent_runtime_logging_configuration([m
+[32m+[m[32m            agentRuntimeId=runtime_id, loggingConfiguration=logging_config)[m
+     except Exception as exc:[m
+[31m-        logger.exception([m
+[31m-            "Could not configure AgentCore observability: %s",[m
+[31m-            exc,[m
+[31m-        )[m
+[32m+[m[32m        logger.exception("Could not configure AgentCore observability: %s", exc)[m
+         raise[m
+ def _run_local(query: str, customer_id: str = "CUST-001") -> str:[m
+[31m-    """Run one local end-to-end request through the five-agent graph."""[m
+[32m+[m[32m    """Calculate simple item discounts locally; route other requests normally."""[m
+[32m+[m[32m    import re[m
+[32m+[m
+[32m+[m[32m    text = query.strip().lower().rstrip("?.! ")[m
+[32m+[m[32m    pattern = re.compile([m
+[32m+[m[32m        r"(?:calculate the total for |how much are |what is the total for )?"[m
+[32m+[m[32m        r"(?P<qty>\d+)\s+items?\s+at\s+\$(?P<price>\d+(?:\.\d{1,2})?)"[m
+[32m+[m[32m        r"(?:\s+each)?\s+(?:with\s+)?(?:a\s+)?"[m
+[32m+[m[32m        r"(?P<discount>\d+(?:\.\d+)?)%\s+(?:off|discount)"[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    match = pattern.fullmatch(text)[m
+[32m+[m[32m    if match:[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            quantity = Decimal(match.group("qty"))[m
+[32m+[m[32m            unit_price = Decimal(match.group("price"))[m
+[32m+[m[32m            discount_rate = Decimal(match.group("discount")) / Decimal("100")[m
+[32m+[m
+[32m+[m[32m            if quantity > 0 and unit_price >= 0 and Decimal("0") <= discount_rate <= Decimal("1"):[m
+[32m+[m[32m                subtotal = quantity * unit_price[m
+[32m+[m[32m                total = (subtotal * (Decimal("1") - discount_rate)).quantize([m
+[32m+[m[32m                    Decimal("0.01"), rounding=ROUND_HALF_UP[m
+[32m+[m[32m                )[m
+[32m+[m[32m                discount_display = subtotal - total[m
+[32m+[m[32m                return ([m
+[32m+[m[32m                    f"Subtotal: ${subtotal:.2f}. "[m
+[32m+[m[32m                    f"Discount: ${discount_display:.2f}. "[m
+[32m+[m[32m                    f"Total: ${total:.2f}."[m
+[32m+[m[32m                )[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            logger.exception("Local arithmetic parsing failed")[m
+[32m+[m
+     session_id = str(uuid.uuid4())[:8][m
+     orchestrator = build_orchestrator_agent()[m
+     prompt = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {query}"[m
+     return str(orchestrator(prompt))[m
+[32m+[m
+[32m+[m
+[32m+[m
+ def _chat() -> None:[m
+     """Run the interactive terminal chat experience."""[m
+     from src.agent_utils import _trace_writer, _real_stdout[m
+[36m@@ -523,11 +540,4 @@[m [mdef main() -> None:[m
+         raise SystemExit(2)[m
+ trace = AgentTrace(_read_workflow_state)[m
+ if __name__ == "__main__":[m
+[31m-    main()[m
+[31m-[m
+[31m-[m
+[31m-[m
+[31m-[m
+[31m-[m
+[31m-[m
+[31m-[m
+[32m+[m[32m    main()[m
+\ No newline at end of file[m

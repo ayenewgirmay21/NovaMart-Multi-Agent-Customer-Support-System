@@ -1,4 +1,4 @@
-"""
+﻿"""
 Small AgentCore Runtime deployment wrapper used by the NovaMart project.
 
 The project orchestrator calls this module instead of directly calling the
@@ -87,7 +87,7 @@ def deploy() -> str:
 
     # The project environment may expose the AgentCore CLI as either
     # `agentcore` or `aws-agentcore`.
-    candidates = ["agentcore", "aws-agentcore"]
+    candidates = [r"D:\Scripts\agentcore.exe", "agentcore.cmd", "aws-agentcore.cmd", "agentcore", "aws-agentcore"]
 
     last_error = None
     for executable in candidates:
@@ -166,3 +166,4 @@ def deployed_runtime_arn() -> str:
         "No deployed runtime ARN is available. Run deploy() first or set "
         "AGENTCORE_RUNTIME_ARN."
     )
+
